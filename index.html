@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>S3 EPUB Reader</title>
+<!-- AWS SDK for JavaScript v2 (browser build) -->
+<script src="https://sdk.amazonaws.com/js/aws-sdk-2.1480.0.min.js"></script>
+<!-- ePub.js (client-side EPUB renderer) -->
+<script src="https://cdn.jsdelivr.net/npm/epubjs@0.3/dist/epub.min.js"></script>
+<!-- JSZip is required by epub.js 0.3.x -->
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+
+<!-- ePub.js (0.3.x) -->
+<script src="https://unpkg.com/epubjs@0.3.93/dist/epub.min.js"></script>
+
+<link rel="stylesheet" href="index.css">
+
+</head>
+<body>
+<header>
+    <h1>📚 S3 EPUB Reader</h1>
+    <div class="config">
+    <input id="region" value="ap-southeast-1" placeholder="AWS Region (e.g. ap-southeast-1)" />
+    <input id="identityPoolId" value="ap-southeast-1:158758b1-813b-4d41-98d8-fb322cc111de" placeholder="Cognito Identity Pool ID (e.g. ap-southeast-1:xxxx-xxxx)" />
+    <input id="bucket" value="truyentranh-net" placeholder="S3 Bucket (e.g. my-epub-bucket)" />
+    <input id="prefix" placeholder="Prefix (e.g. novels/)" />
+    <button id="connectBtn">Connect & List</button>
+    </div>
+</header>
+
+<main>
+    <aside>
+    <div class="listHdr">Available EPUBs in <span id="prefixShow" class="muted"></span></div>
+    <ul id="books"></ul>
+    <div class="note">
+        <div>Tips:</div>
+        <ul>
+        <li>Use a <b>Cognito Identity Pool</b> (unauth role) that can <code>s3:ListBucket</code> for your prefix and <code>s3:GetObject</code> on EPUB files.</li>
+        <li>Ensure your S3 bucket CORS allows <code>GET</code>/<code>HEAD</code> from this domain.</li>
+        </ul>
+    </div>
+    </aside>
+
+    <section id="viewerWrap">
+    <div class="toolbar">
+        <button id="prevBtn">← Prev</button>
+        <button id="nextBtn">Next →</button>
+        <label class="muted">Font: <input id="fontSlider" type="range" min="80" max="160" value="100" /></label>
+        <select id="theme">
+        <option value="dark" selected>Dark</option>
+        <option value="sepia">Sepia</option>
+        <option value="light">Light</option>
+        </select>
+        <button id="tocBtn">TOC</button>
+        <span id="status" class="muted" style="margin-left:auto"></span>
+    </div>
+    <div id="viewer"></div>
+    </section>
+</main>
+
+<script>
+    // ====== Minimal state ======
+    let s3 = null;
+    let currentBook = null;
+    let rendition = null;
+
+    const els = {
+        region: document.getElementById('region'),
+        identityPoolId: document.getElementById('identityPoolId'),
+        bucket: document.getElementById('bucket'),
+        prefix: document.getElementById('prefix'),
+        connectBtn: document.getElementById('connectBtn'),
+        books: document.getElementById('books'),
+        prefixShow: document.getElementById('prefixShow'),
+        viewer: document.getElementById('viewer'),
+        status: document.getElementById('status'),
+        prev: document.getElementById('prevBtn'),
+        next: document.getElementById('nextBtn'),
+        fontSlider: document.getElementById('fontSlider'),
+        theme: document.getElementById('theme'),
+        tocBtn: document.getElementById('tocBtn')
+    };
+
+    // Prefill from localStorage for convenience
+    ['region','identityPoolId','bucket','prefix'].forEach(k => {
+    const v = localStorage.getItem('s3epub.'+k);
+    if (v) els[k].value = v;
+    });
+
+    function setStatus(msg) { els.status.textContent = msg || ''; }
+
+
+    // ====== AWS init & listing ======
+    async function connectAndList() {
+    const region = els.region.value.trim();
+    const identityPoolId = els.identityPoolId.value.trim();
+    const bucket = els.bucket.value.trim();
+    const prefix = els.prefix.value.trim();
+    if (!region || !identityPoolId || !bucket) {
+        alert('Please fill Region, Identity Pool ID, and Bucket. Prefix is optional.');
+        return;
+    }
+
+    // persist
+    localStorage.setItem('s3epub.region', region);
+    localStorage.setItem('s3epub.identityPoolId', identityPoolId);
+    localStorage.setItem('s3epub.bucket', bucket);
+    localStorage.setItem('s3epub.prefix', prefix);
+
+    setStatus('Connecting…');
+    AWS.config.region = region;
+    AWS.config.credentials = new AWS.CognitoIdentityCredentials({ IdentityPoolId: identityPoolId });
+
+    await new Promise((resolve, reject) => {
+        AWS.config.credentials.get(err => err ? reject(err) : resolve());
+    });
+
+    s3 = new AWS.S3({ apiVersion: '2006-03-01', params: { Bucket: bucket } });
+    setStatus('Listing…');
+    els.prefixShow.textContent = prefix ? ('s3://' + bucket + '/' + prefix) : ('s3://' + bucket);
+    
+    
+
+    const keys = await listAllEPUBs(bucket, prefix);
+    renderList(keys);
+    setStatus(keys.length ? `Found ${keys.length} file(s)` : 'No EPUBs found');
+    }
+
+    async function listAllEPUBs(bucket, prefix) {
+    const all = [];
+    let ContinuationToken = undefined;
+    do {
+        const params = { Bucket: bucket, Prefix: prefix || undefined, ContinuationToken };
+        const res = await s3.listObjectsV2(params).promise();
+        (res.Contents || []).forEach(o => { if (/\.epub$/i.test(o.Key)) all.push(o.Key); });
+        ContinuationToken = res.IsTruncated ? res.NextContinuationToken : undefined;
+    } while (ContinuationToken);
+    return all.sort((a,b) => a.localeCompare(b));
+    }
+
+    function renderList(keys) {
+    els.books.innerHTML = '';
+    keys.forEach(key => {
+        const li = document.createElement('li');
+        const btn = document.createElement('button');
+        btn.textContent = key.replace(els.prefix.value, '').replace(/^\//,'');
+        btn.title = key;
+        btn.onclick = () => openKey(key);
+        li.appendChild(btn);
+        els.books.appendChild(li);
+    });
+    }
+
+    // Helper: fetch with timeout
+    const withTimeout = (p, ms, label) =>
+    Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} timeout after ${ms}ms`)), ms))]);
+
+    s3 = new AWS.S3({ apiVersion: '2006-03-01', region: AWS.config.region });
+
+    // --- If you're using Cognito + AWS.S3 client (s3.getSignedUrl) ---
+    async function openKey(key) {
+    if (!s3) return alert('Not connected to S3 yet.');
+    const bucket = els.bucket.value.trim();
+
+    try {
+        setStatus('Signing URL…');
+        const url = s3.getSignedUrl('getObject', { Bucket: bucket, Key: key, Expires: 300 });
+
+        setStatus('Fetching…');
+        const res = await withTimeout(fetch(url, { mode: 'cors', cache: 'no-store' }), 30000, 'GET epub');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const blob = await res.blob();
+
+        setStatus('Opening…');
+        await openBookFromBlob(blob);
+
+        setStatus('');
+        location.hash = encodeURIComponent(key);
+    } catch (err) {
+        console.error(err);
+        setStatus('');
+        alert('Failed to open book: ' + (err?.message || err));
+    }
+    }
+
+    // --- If you're using the presign API (/url?key=...) I gave earlier ---
+    // async function openKey(key) {
+    //   const apiBase = els.apiBase.value.trim().replace(/\/$/, '');
+    //   setStatus('Signing URL…');
+    //   const r = await fetch(`${apiBase}/url?key=${encodeURIComponent(key)}`);
+    //   if (!r.ok) throw new Error(`Sign failed ${r.status}`);
+    //   const { url } = await r.json();
+    //   setStatus('Fetching…');
+    //   const res = await fetch(url, { mode: 'cors', cache: 'no-store' });
+    //   if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    //   const blob = await res.blob();
+    //   setStatus('Opening…');
+    //   await openBookFromBlob(blob);
+    //   setStatus('');
+    //   location.hash = encodeURIComponent(key);
+    // }
+
+    async function openBookFromBlob(blob) {
+    // Clean up previous
+    try { rendition && rendition.destroy(); } catch {}
+    try { currentBook && currentBook.destroy(); } catch {}
+    rendition = null; currentBook = null;
+
+    // Force binary open so ePub.js unzips the file (prevents /META-INF HTTP 404)
+    const ab = await blob.arrayBuffer();
+    currentBook = ePub({ worker: 'https://unpkg.com/epubjs@0.3.93/dist/epub.worker.min.js' });
+    await currentBook.open(ab, 'binary');
+
+    rendition = currentBook.renderTo('viewer', {
+        width: '100%', height: '100%', spread: 'auto', minSpreadWidth: 800
+    });
+    applyTheme(els.theme.value);
+    applyFontSize(+els.fontSlider.value);
+    await rendition.display();
+
+    // Keyboard + TOC (keep your existing code)
+    document.onkeydown = (e) => { if (e.key === 'ArrowLeft') rendition.prev(); if (e.key === 'ArrowRight') rendition.next(); };
+    els.tocBtn.onclick = async () => {
+        const nav = await currentBook.loaded.navigation;
+        const items = nav.toc || [];
+        const choice = prompt('Go to chapter (enter number)\n' + items.map((c,i)=>`${i+1}. ${c.label}`).join('\n'));
+        const idx = Number(choice) - 1;
+        if (!isNaN(idx) && items[idx]) rendition.display(items[idx].href);
+    };
+    }
+
+    // ====== EPUB viewer ======
+    async function openBook(url) {
+    try {
+        // Destroy previous book if any
+        if (rendition) { try { rendition.destroy(); } catch (_) {} }
+        if (currentBook) { try { currentBook.destroy(); } catch (_) {} }
+
+        currentBook = ePub(url);
+        rendition = currentBook.renderTo('viewer', {
+        width: '100%',
+        height: '100%',
+        spread: 'auto',
+        minSpreadWidth: 800
+        });
+        applyTheme(els.theme.value);
+        applyFontSize(+els.fontSlider.value);
+        await rendition.display();
+
+        // Keyboard nav
+        document.onkeydown = (e) => {
+        if (e.key === 'ArrowLeft') rendition.prev();
+        if (e.key === 'ArrowRight') rendition.next();
+        };
+
+        // Optional: load TOC for quick jumps
+        els.tocBtn.onclick = async () => {
+        const nav = await currentBook.loaded.navigation;
+        const items = nav.toc || [];
+        const choice = prompt('Go to chapter (enter number)\n' + items.map((c,i)=>`${i+1}. ${c.label}`).join('\n'));
+        const idx = Number(choice) - 1;
+        if (!isNaN(idx) && items[idx]) rendition.display(items[idx].href);
+        };
+
+    } catch (err) {
+        console.error(err);
+        alert('Failed to open book: ' + (err && err.message ? err.message : err));
+    }
+    }
+
+    function applyTheme(name) {
+    if (!rendition) return;
+    const themes = {
+        dark: { 'body': { 'background': '#0a0f1d', 'color': '#e6e9f0' } },
+        sepia: { 'body': { 'background': '#fbf0d9', 'color': '#5b4636' } },
+        light: { 'body': { 'background': '#ffffff', 'color': '#111' } }
+    };
+    // Register and select
+    Object.entries(themes).forEach(([k, css]) => rendition.themes.register(k, css));
+    rendition.themes.select(name);
+    }
+    function applyFontSize(pct) {
+    if (!rendition) return;
+    rendition.themes.fontSize(pct + '%');
+    }
+
+    // Controls
+    els.connectBtn.onclick = () => connectAndList().catch(err => {
+    console.error(err);
+    alert('AWS connect/list error: ' + (err && err.message ? err.message : err));
+    setStatus('');
+    });
+    els.prev.onclick = () => rendition && rendition.prev();
+    els.next.onclick = () => rendition && rendition.next();
+    els.fontSlider.oninput = () => applyFontSize(+els.fontSlider.value);
+    els.theme.onchange = () => applyTheme(els.theme.value);
+
+    // Deep-link: if hash has a key, try opening after connect
+    window.addEventListener('hashchange', () => {
+    const key = decodeURIComponent(location.hash.slice(1));
+    if (key) openKey(key);
+    });
+</script>
+</body>
+</html>
